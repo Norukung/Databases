@@ -1,0 +1,33 @@
+{
+  "passed": true,
+  "at": "2026-10-11T20:42:29.424Z",
+  "checks": [
+    "maintenance scheduling through form and availability exclusion",
+    "tablet maintenance 768px without page overflow",
+    "revoked staff payment review hidden and denied",
+    "desktop home",
+    "multi-room booking with promotion and service",
+    "customer proof upload remains under review",
+    "staff approval",
+    "check-in",
+    "planned service marked used",
+    "check-out",
+    "room preparation",
+    "admin price edit",
+    "mobile overflow 390px",
+    "customer cancellation request and staff approval",
+    "table search and pagination",
+    "other customer booking denied",
+    "two-tab simultaneous mock booking: exactly one succeeds in each of 8 rounds",
+    "zero uncaught browser exceptions"
+  ],
+  "screenshots": [
+    "booking-payment-review.png",
+    "home-desktop.png",
+    "home-mobile.png",
+    "maintenance-tablet.png",
+    "proof.png",
+    "staff-desktop.png",
+    "staff-mobile.png"
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "name": "ginger-hotel-project",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Single-hotel student project: vanilla frontend and Oracle database scripts",
+  "scripts": { "start": "node tools/server.cjs", "test": "node --test tests/*.test.cjs", "test:browser": "node tests/browser.cjs" }
+}

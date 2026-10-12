@@ -1,0 +1,140 @@
+-- Oracle 19c queries against the Normalize.pdf schema + proposed migration.
+-- Dates are bound as DATE at midnight in hotel time, never interpolated strings.
+-- :actor_customer_id, :is_staff and :is_admin come from the authenticated server
+-- session, NOT HTTP query/body parameters supplied by a browser.
+
+-- Q01 Available physical rooms. Half-open interval [check-in, check-out).
+SELECT r.ROOM_ID, r.ROOM_NUMBER, t.ROOM_TYPE_ID, t.TYPE_NAME,
+       t.BED_COUNT, t.MAX_GUESTS, t.PRICE_PER_NIGHT, t.AREA_SQM
+FROM ROOMS r JOIN ROOM_TYPES t ON t.ROOM_TYPE_ID = r.ROOM_TYPE_ID
+WHERE r.IS_ACTIVE = 1 AND t.DELETED_AT IS NULL AND r.ROOM_STATUS <> 'MAINTENANCE'
+  AND :check_out > :check_in
+  AND :check_in >= TRUNC(CAST(SYSTIMESTAMP AT TIME ZONE 'Asia/Bangkok' AS DATE))
+  AND :check_out - :check_in <= 30
+  AND (:type_id IS NULL OR t.ROOM_TYPE_ID = :type_id)
+  AND (:max_price IS NULL OR t.PRICE_PER_NIGHT <= :max_price)
+  AND (:min_capacity IS NULL OR t.MAX_GUESTS >= :min_capacity)
+  AND NOT EXISTS (
+    SELECT 1 FROM BOOKING_ROOMS br JOIN BOOKINGS b ON b.BOOKING_ID = br.BOOKING_ID
+    WHERE br.ROOM_ID = r.ROOM_ID
+      AND (b.BOOKING_STATUS IN ('CONFIRMED','CHECKED_IN') OR
+           (b.BOOKING_STATUS = 'PENDING_PAYMENT' AND
+            (b.EXPIRES_AT > CAST(SYSTIMESTAMP AT TIME ZONE 'Asia/Bangkok' AS TIMESTAMP) OR EXISTS
+              (SELECT 1 FROM PAYMENTS p WHERE p.BOOKING_ID = b.BOOKING_ID AND p.PAYMENT_STATUS = 'UNDER_REVIEW'))))
+      AND ((b.CHECK_IN_DATE < :check_out AND b.CHECK_OUT_DATE > :check_in)
+        OR (b.BOOKING_STATUS = 'CHECKED_IN'
+          AND b.CHECK_OUT_DATE <= TRUNC(CAST(SYSTIMESTAMP AT TIME ZONE 'Asia/Bangkok' AS DATE))
+          AND :check_in = TRUNC(CAST(SYSTIMESTAMP AT TIME ZONE 'Asia/Bangkok' AS DATE))))
+  )
+  AND NOT EXISTS (SELECT 1 FROM ROOM_MAINTENANCE m WHERE m.ROOM_ID = r.ROOM_ID
+                 AND m.START_DATE < :check_out AND m.END_DATE > :check_in)
+ORDER BY t.PRICE_PER_NIGHT, r.ROOM_ID;
+-- Backend groups Q01 by type and returns availableRooms. Recheck under locks
+-- during create_booking. Q01 alone is not a reservation.
+
+-- Q02 Active services, billed per explicitly selected unit.
+SELECT SERVICE_ID, SERVICE_NAME, DESCRIPTION, UNIT_PRICE FROM SERVICES
+WHERE DELETED_AT IS NULL AND SERVICE_STATUS='ACTIVE' ORDER BY SERVICE_ID;
+
+-- Q03 Eligible promotions. :room_amount and :nights are server-calculated.
+SELECT PROMOTION_ID, PROMOTION_CODE, PROMOTION_NAME, DISCOUNT_PERCENT,
+       MIN_NIGHTS, MIN_ROOM_AMOUNT, START_DATE, END_DATE
+FROM PROMOTIONS
+WHERE DELETED_AT IS NULL AND :nights >= MIN_NIGHTS AND :room_amount >= MIN_ROOM_AMOUNT
+  AND TRUNC(CAST(SYSTIMESTAMP AT TIME ZONE 'Asia/Bangkok' AS DATE)) BETWEEN START_DATE AND END_DATE
+ORDER BY DISCOUNT_PERCENT DESC;
+
+-- Q04 Own bookings, filtered and paginated. STAFF can view all with server authorization.
+SELECT b.*, c.FIRST_NAME, c.LAST_NAME,
+       NVL((SELECT SUM(p.AMOUNT) FROM PAYMENTS p WHERE p.BOOKING_ID=b.BOOKING_ID AND p.PAYMENT_STATUS='PAID'),0) AS PAID_AMOUNT
+FROM BOOKINGS b JOIN CUSTOMERS c ON c.CUSTOMER_ID=b.CUSTOMER_ID
+WHERE (:is_staff = 1 OR b.CUSTOMER_ID = :actor_customer_id)
+  AND (:status IS NULL OR b.BOOKING_STATUS = :status)
+  AND (:search IS NULL OR TO_CHAR(b.BOOKING_ID) = :search OR 'GH-'||LPAD(TO_CHAR(b.BOOKING_ID),GREATEST(5,LENGTH(TO_CHAR(b.BOOKING_ID))),'0')=UPPER(:search) OR
+       LOWER(c.FIRST_NAME || ' ' || c.LAST_NAME) LIKE '%' || LOWER(:search) || '%')
+ORDER BY b.CREATED_AT DESC, b.BOOKING_ID DESC
+OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY;
+
+-- Q05 Booking room details and stored agreed rates, never today's catalogue price.
+SELECT br.ROOM_ID, r.ROOM_NUMBER, t.TYPE_NAME, br.AGREED_PRICE_PER_NIGHT,
+       (b.CHECK_OUT_DATE-b.CHECK_IN_DATE) AS NIGHTS,
+       br.AGREED_PRICE_PER_NIGHT*(b.CHECK_OUT_DATE-b.CHECK_IN_DATE) AS ROOM_LINE_AMOUNT
+FROM BOOKING_ROOMS br JOIN BOOKINGS b ON b.BOOKING_ID=br.BOOKING_ID
+JOIN ROOMS r ON r.ROOM_ID=br.ROOM_ID JOIN ROOM_TYPES t ON t.ROOM_TYPE_ID=r.ROOM_TYPE_ID
+WHERE b.BOOKING_ID=:booking_id AND (:is_staff=1 OR b.CUSTOMER_ID=:actor_customer_id)
+ORDER BY r.ROOM_ID;
+
+-- Q06 Payment history. Do not return PAYMENT_PROOF (private storage key) in listings.
+SELECT p.PAYMENT_ID, p.AMOUNT, p.PAYMENT_STATUS, p.PAYMENT_METHOD, p.SUBMITTED_AT, p.PAID_AT,
+       p.REVIEWED_BY, p.REVIEWED_AT, p.REVIEW_NOTE,
+       CASE WHEN p.PAYMENT_PROOF IS NULL THEN 0 ELSE 1 END AS HAS_PROOF
+FROM PAYMENTS p JOIN BOOKINGS b ON b.BOOKING_ID=p.BOOKING_ID
+WHERE b.BOOKING_ID=:booking_id AND (:is_staff=1 OR b.CUSTOMER_ID=:actor_customer_id)
+ORDER BY p.CREATED_AT, p.PAYMENT_ID;
+
+-- Q07 Today's expected arrivals and departures, plus overdue departures.
+SELECT b.*, c.FIRST_NAME, c.LAST_NAME,
+       CASE WHEN b.BOOKING_STATUS='CONFIRMED' THEN 'ARRIVAL' ELSE 'DEPARTURE' END AS WORK_TYPE
+FROM BOOKINGS b JOIN CUSTOMERS c ON c.CUSTOMER_ID=b.CUSTOMER_ID
+WHERE :is_staff=1 AND ((b.BOOKING_STATUS='CONFIRMED' AND b.CHECK_IN_DATE=:hotel_day)
+  OR (b.BOOKING_STATUS='CHECKED_IN' AND b.CHECK_OUT_DATE<=:hotel_day))
+ORDER BY b.CHECK_IN_DATE, b.BOOKING_ID;
+
+-- Q08 Actual stay history. Date bounds are timestamps in hotel timezone.
+SELECT h.*, b.CUSTOMER_ID, b.CHECK_IN_DATE, b.CHECK_OUT_DATE
+FROM STAY_HISTORY h JOIN BOOKINGS b ON b.BOOKING_ID=h.BOOKING_ID
+WHERE (:is_staff=1 OR b.CUSTOMER_ID=:actor_customer_id)
+  AND (:booking_id IS NULL OR b.BOOKING_ID=:booking_id)
+  AND (:from_time IS NULL OR h.ACTUAL_CHECK_IN>=:from_time)
+  AND (:to_time IS NULL OR h.ACTUAL_CHECK_IN<:to_time)
+ORDER BY h.ACTUAL_CHECK_IN DESC;
+
+-- Q09 Planned / used / cancelled service records. Snapshot price retained.
+SELECT u.*, s.SERVICE_NAME, u.QUANTITY*u.UNIT_PRICE_AT_USE AS LINE_AMOUNT
+FROM SERVICE_USAGE u JOIN SERVICES s ON s.SERVICE_ID=u.SERVICE_ID
+JOIN BOOKINGS b ON b.BOOKING_ID=u.BOOKING_ID
+WHERE b.BOOKING_ID=:booking_id AND (:is_staff=1 OR b.CUSTOMER_ID=:actor_customer_id)
+ORDER BY u.USAGE_ID;
+
+-- Q10 Cancellation requests and actual refunds, separate from policy refund amount.
+SELECT q.REQUEST_ID, q.REQUEST_STATUS, q.REASON, q.REVIEW_NOTE,
+       c.CANCELLATION_ID, c.REFUND_AMOUNT, r.REFUND_STATUS, r.TRANSFER_REFERENCE
+FROM CANCELLATION_REQUESTS q JOIN BOOKINGS b ON b.BOOKING_ID=q.BOOKING_ID
+LEFT JOIN CANCELLATIONS c ON c.BOOKING_ID=b.BOOKING_ID
+LEFT JOIN REFUNDS r ON r.CANCELLATION_ID=c.CANCELLATION_ID
+WHERE b.BOOKING_ID=:booking_id AND (:is_staff=1 OR b.CUSTOMER_ID=:actor_customer_id)
+ORDER BY q.CREATED_AT;
+
+-- Q11 ADMIN master data. Explicit allowlist of queries; never bind table names.
+SELECT e.EMPLOYEE_ID,e.FIRST_NAME,e.LAST_NAME,e.SYSTEM_ROLE,CASE WHEN e.DELETED_AT IS NULL THEN 1 ELSE 0 END AS IS_ACTIVE,e.JOB_TITLE,e.UPDATED_AT
+FROM EMPLOYEES e WHERE :is_admin=1 ORDER BY e.EMPLOYEE_ID OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY;
+SELECT c.* FROM CUSTOMERS c WHERE :is_admin=1 ORDER BY c.CUSTOMER_ID OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY;
+SELECT r.* FROM ROOMS r WHERE :is_staff=1 ORDER BY r.ROOM_NUMBER OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY;
+SELECT t.* FROM ROOM_TYPES t WHERE :is_admin=1 ORDER BY t.ROOM_TYPE_ID;
+SELECT s.* FROM SERVICES s WHERE :is_admin=1 ORDER BY s.SERVICE_ID;
+SELECT p.* FROM PROMOTIONS p WHERE :is_admin=1 ORDER BY p.PROMOTION_ID;
+SELECT * FROM CUSTOMER_EMAILS WHERE :is_admin=1 AND CUSTOMER_ID=:customer_id;
+SELECT * FROM CUSTOMER_PHONES WHERE :is_admin=1 AND CUSTOMER_ID=:customer_id;
+SELECT * FROM EMPLOYEE_EMAILS WHERE :is_admin=1 AND EMPLOYEE_ID=:employee_id;
+SELECT * FROM EMPLOYEE_PHONES WHERE :is_admin=1 AND EMPLOYEE_ID=:employee_id;
+
+-- Q12 Dashboard counts. Server verifies STAFF/ADMIN before execution.
+SELECT
+ (SELECT COUNT(*) FROM BOOKINGS WHERE BOOKING_STATUS='CONFIRMED' AND CHECK_IN_DATE=:hotel_day) CHECK_INS,
+ (SELECT COUNT(*) FROM BOOKINGS WHERE BOOKING_STATUS='CHECKED_IN' AND CHECK_OUT_DATE<=:hotel_day) CHECK_OUTS,
+ (SELECT COUNT(*) FROM PAYMENTS WHERE PAYMENT_STATUS='UNDER_REVIEW') PAYMENT_REVIEWS,
+ (SELECT COUNT(*) FROM CANCELLATION_REQUESTS WHERE REQUEST_STATUS='PENDING') CANCELLATION_REVIEWS
+FROM DUAL WHERE :is_staff=1;
+
+-- Q13 Scheduled maintenance, including historical periods. STAFF may inspect; ADMIN writes.
+SELECT m.*,r.ROOM_NUMBER FROM ROOM_MAINTENANCE m JOIN ROOMS r ON r.ROOM_ID=m.ROOM_ID
+WHERE :is_staff=1 ORDER BY m.START_DATE DESC,m.MAINTENANCE_ID DESC;
+-- Q14 Primary contacts for authorized staff selecting a customer for a walk-in booking.
+SELECT c.CUSTOMER_ID,c.FIRST_NAME,c.LAST_NAME,e.EMAIL,p.PHONE_NUMBER,
+  CASE WHEN c.DELETED_AT IS NULL THEN 1 ELSE 0 END AS IS_ACTIVE
+FROM CUSTOMERS c LEFT JOIN CUSTOMER_EMAILS e ON e.CUSTOMER_ID=c.CUSTOMER_ID AND e.IS_PRIMARY=1
+LEFT JOIN CUSTOMER_PHONES p ON p.CUSTOMER_ID=c.CUSTOMER_ID AND p.IS_PRIMARY=1
+WHERE :is_staff=1 ORDER BY c.CUSTOMER_ID;
+-- Q15 Existing employee web-account permissions; no password hash is returned.
+SELECT e.EMPLOYEE_ID,e.JOB_TITLE,a.CAN_REVIEW_PAYMENTS,a.CAN_REVIEW_CANCELLATIONS
+FROM EMPLOYEES e LEFT JOIN WEB_ACCOUNTS a ON a.EMPLOYEE_ID=e.EMPLOYEE_ID WHERE :is_admin=1;
